@@ -6,13 +6,12 @@ import subprocess
 import tarfile
 import tempfile
 import time
-import warnings
 import zlib
 
 from m3u8_To_MP4.helpers import path_helper
 from m3u8_To_MP4.helpers import printer_helper
-from m3u8_To_MP4.helpers.os_helper import get_core_count
 from m3u8_To_MP4.networks.synchronous import sync_DNS
+from m3u8_To_MP4.helpers.os_helper import get_core_count
 
 printer_helper.config_logging()
 
@@ -20,21 +19,26 @@ printer_helper.config_logging()
 class AbstractCrawler(object):
     def __init__(self,
                  m3u8_uri,
-                 file_path='./m3u8_To_MP4.mp4',
                  customized_http_header=None,
                  max_retry_times=3,
                  num_concurrent=50,
-                 tmpdir=None
+                 mp4_file_dir=None,
+                 mp4_file_name='m3u8_To_MP4',
+                 tmpdir=None,
+                 subtitle=None
                  ):
         self.m3u8_uri = m3u8_uri
         self.customized_http_header = customized_http_header
 
         self.max_retry_times = max_retry_times
         self.num_concurrent = num_concurrent
-
+        self.subtitle_file_path = subtitle
         self.tmpdir = tmpdir
 
-        self.file_path = file_path
+        self.mp4_file_dir = mp4_file_dir
+        self.mp4_file_name = mp4_file_name
+
+        self.use_ffmpeg = True
 
     def __enter__(self):
         if self.tmpdir is None:
@@ -44,13 +48,13 @@ class AbstractCrawler(object):
 
         self._find_out_done_ts()
 
-        self._legalize_file_path()
-        # self._imitate_tar_file_path()
+        self._legalize_mp4_file_path()
+        self._imitate_tar_file_path()
 
         print('\nsummary')
-        print('m3u8_uri: {};\nmax_retry_times: {};\ntmp_dir: {};\nmp4_file_path: {};\n'.format(
-                self.m3u8_uri, self.max_retry_times, self.tmpdir,
-                self.file_path))
+        print( 'm3u8_uri: {};\nmax_retry_times: {};\ntmp_dir: {};\nmp4_file_path: {};\n'.format(
+                        self.m3u8_uri, self.max_retry_times, self.tmpdir,
+                        self.mp4_file_path))
 
         return self
 
@@ -90,25 +94,31 @@ class AbstractCrawler(object):
 
         self.fetched_file_names = full_ts_file_names
 
-    def _legalize_file_path(self):
-        parent = os.path.dirname(self.file_path)
-        if not os.path.exists(parent):
-            parent = os.getcwd()
-            print('{} does not exists, remap to current directory.')
+    def _legalize_mp4_file_path(self):
+        if not os.path.exists(self.mp4_file_dir):
+            self.mp4_file_dir = os.getcwd()
+            print('{} does not exists, current directory is set automatically.')
 
-        name = os.path.basename(self.file_path)
-        name = path_helper.calibrate_mp4_file_name(name)
+        if self.mp4_file_dir is None:
+            self.mp4_file_dir = os.getcwd()
 
+        mp4_file_name = path_helper.calibrate_mp4_file_name(self.mp4_file_name)
         # if not is_valid:
         #     mp4_file_name = path_helper.create_mp4_file_name()
-        self.file_path = os.path.join(parent, name)
 
-        if os.path.exists(self.file_path):
-            mp4_file_name = path_helper.random_name()
-            self.file_path = os.path.join(parent, mp4_file_name)
+        mp4_file_path = os.path.join(self.mp4_file_dir, mp4_file_name)
+
+        # if os.path.exists(mp4_file_path):
+        #     mp4_file_name = path_helper.random_name()
+        #     mp4_file_path = os.path.join(self.mp4_file_dir, mp4_file_name)
+
+        self.mp4_file_path = mp4_file_path
+
+    def _imitate_tar_file_path(self):
+        self.tar_file_path = self.mp4_file_path[:-4] + '.tar.bz2'
 
     def _resolve_DNS(self):
-        self.available_addr_info_pool = sync_DNS.available_addr_infos_of_url(self.m3u8_uri)
+        self.available_addr_info_pool = sync_DNS.available_addr_infos_of_url( self.m3u8_uri)
         self.best_addr_info = self.available_addr_info_pool[0]
 
         logging.info('Resolved available hosts:')
@@ -148,7 +158,7 @@ class AbstractCrawler(object):
         key_segments_pairs = [(_encrypted_key, segment_uri) for
                               _encrypted_key, segment_uri in key_segments_pairs
                               if not self._is_fetched(segment_uri)]
-        self.num_fetched_ts_segments = num_ts_segments - len(key_segments_pairs)
+        self.num_fetched_ts_segments = num_ts_segments - len( key_segments_pairs)
 
         return key_segments_pairs
 
@@ -159,62 +169,67 @@ class AbstractCrawler(object):
         with open(self.segment_path_recipe, 'w', encoding='utf8') as fw:
             for _, segment in key_segment_pairs:
                 file_name = path_helper.resolve_file_name_by_uri(segment)
-                segment_file_path = os.path.join(self.tmpdir, file_name)
+                segment_file_path = file_name
 
                 fw.write("file '{}'\n".format(segment_file_path))
 
-    def _merge_to_mp4(self):
-        if not self.file_path.endswith('mp4'):
-            warnings.warn('{} does not end with .mp4'.format(self.file_path))
-
-        logging.info("merging segments...")
+    def _merge_to_mp4_by_ffmpeg(self):
+        logging.info("merging segments wleee...")
 
         # copy mode
-        merge_cmd = "ffmpeg " + \
-                    "-y -f concat -threads {} -safe 0 ".format(get_core_count()) + \
-                    "-i " + '"' + self.segment_path_recipe + '" ' + \
-                    "-c copy " + \
-                    '"' + self.file_path + '"'
+        ffmpeg_exe = "ffmpeg"
+        subtitle_args = ""
+        if self.subtitle_file_path and os.path.exists(self.subtitle_file_path):
+            # subtitle_args = f'-itsoffset 0.5 -i "{self.subtitle_file_path}" -c:s mov_text -map 0 -map 1'
+            subtitle_args = f'-i "{self.subtitle_file_path}" -c:s mov_text -map 0 -map 1'
+        else:
+            logging.warning(f"Subtitle file not found: {self.subtitle_file_path}. Merging without subtitles.")
+            subtitle_args = "-map 0" # Only map the video/audio streams
+
+        # merge_cmd = r"C:\Users\User\Desktop\nino\ffmpeg\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe " +\
+        #             "-y -f concat -threads {} -safe 0 ".format(get_core_count()) +\
+        #             "-i "+ '"' + self.segment_path_recipe + '" ' + \
+        #             "-c copy " + \
+        #             '"' + self.mp4_file_path + '"'
+        merge_cmd = (
+            f'{ffmpeg_exe} '
+            f'-y -f concat -threads {get_core_count()} -safe 0 '
+            f'-i "{self.segment_path_recipe}" '
+            f'{subtitle_args} ' # Add subtitle input and mapping
+            f'-c:v copy -c:a copy ' # Specify copy for video and audio explicitly
+            f'"{self.mp4_file_path}"'
+        )
         p = subprocess.Popen(merge_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         p.communicate()
 
         # change codec
-        if os.path.getsize(self.file_path) < 1:
+        if os.path.getsize(self.mp4_file_path) < 1:
             logging.info("merged failed.")
             logging.info("change codec and re-merge segments (it may take long time.)")
 
-            merge_cmd = "ffmpeg " + \
-                        "-y -f concat -threads {} -safe 0 ".format(get_core_count()) + \
-                        "-i " + '"' + self.segment_path_recipe + '" ' + \
-                        '"' + self.file_path + '"'
+            # merge_cmd = r"C:\Users\User\Desktop\nino\ffmpeg\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe " + \
+            #             "-y -f concat -threads {} -safe 0 ".format(get_core_count()) + \
+            #             "-i "+ '"' + self.segment_path_recipe + '" ' + \
+            #             '"' + self.mp4_file_path + '"'
+            merge_cmd = (
+                f'{ffmpeg_exe} '
+                f'-y -f concat -threads {get_core_count()} -safe 0 '
+                f'-i "{self.segment_path_recipe}" '
+                f'{subtitle_args} ' # Add subtitle input and mapping AGAIN for the fallback
+                f'"{self.mp4_file_path}"'
+            )
             p = subprocess.Popen(merge_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             p.communicate()
 
-    def _merge_to_ts(self):
-        if not self.file_path.endswith('ts'):
-            warnings.warn('{} does not end with .mp4'.format(self.file_path))
 
-        ts_paths = list()
-        with open(self.segment_path_recipe, 'r', encoding='utf8') as fr:
-            for line in fr:
-                line = line.strip()
-                if len(line) < 1:
-                    continue
-                ts_paths.append(line[6:-1])
+    def _merge_to_mp4_by_os(self):
+        raise NotImplementedError
 
-        with open(self.file_path, 'ab') as fw:
-            for ts_path in ts_paths:
-                with open(ts_path, 'rb') as fr:
-                    fw.write(fr.read())
-
-    def _merge_to_tar(self):
-        if not self.file_path.endswith('tar'):
-            warnings.warn('{} does not end with .mp4'.format(self.file_path))
-
-        with tarfile.open(self.file_path, 'w:bz2') as targz:
+    def _merge_to_tar_by_os(self):
+        with tarfile.open(self.tar_file_path, 'w:bz2') as targz:
             targz.add(name=self.tmpdir, arcname=os.path.basename(self.tmpdir))
 
-    def fetch_mp4_by_m3u8_uri(self, format='ts'):
+    def fetch_mp4_by_m3u8_uri(self, as_mp4):
         task_start_time = time.time()
 
         # preparation
@@ -235,13 +250,13 @@ class AbstractCrawler(object):
             self._fetch_segments_to_local_tmpdir(key_segments_pairs)
         fetch_end_time = time.time()
 
-        # merge
-        if format == 'ts':
-            self._merge_to_ts()
-        elif format == 'mp4':
-            self._merge_to_mp4()
-        elif format == 'tar':
-            self._merge_to_tar()
+        if as_mp4:
+            self._merge_to_mp4_by_ffmpeg()
 
-        task_end_time = time.time()
-        printer_helper.display_speed(task_start_time, fetch_end_time, task_end_time, self.file_path)
+            task_end_time = time.time()
+            printer_helper.display_speed(task_start_time, fetch_end_time, task_end_time, self.mp4_file_path)
+        else:
+            self._merge_to_tar_by_os()
+
+            task_end_time = time.time()
+            printer_helper.display_speed(task_start_time, fetch_end_time, task_end_time, self.tar_file_path)
